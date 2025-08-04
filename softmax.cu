@@ -25,8 +25,8 @@
 	} while (0)
 
 // Constants
-#define MIN_LOGIT		-50.0f
-#define MAX_LOGIT		50.0f
+#define MIN_LOGIT		-100.0f
+#define MAX_LOGIT		100.0f
 #define COMBINED_MAX	((1UL << 30) - 1)
 #define ELEM_COUNT      (10UL * 1000 * 1000UL)
 
