@@ -1,184 +1,232 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <math.h>
 #include <cuda.h>
+#include <immintrin.h>
 #include <cuda_runtime.h>
 
-// Error checking macro
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error in %s at line %d: %s\n", \
-                __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
-} while (0)
+// Error checking macros
+#define CUDA_CHECK(call)				\
+	do {								\
+		cudaError_t err = call;			\
+		if (err != cudaSuccess) {		\
+			fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+			abort();					\
+		}								\
+	} while (0)
 
-// Step 1: Kernel for exponentiation
-__global__ void expKernel(float* input, float* output, unsigned int n)
+#define HOST_CHECK(cond, msg)			\
+	do {								\
+		if (!(cond)) {					\
+			fprintf(stderr, "Host error: %s\n", (msg)); \
+			abort();					\
+		}								\
+	} while (0)
+
+// Constants
+#define MIN_LOGIT		-50.0f
+#define MAX_LOGIT		50.0f
+#define COMBINED_MAX	((1UL << 30) - 1)
+#define THREADS_PER_BLK	512UL
+#define ELEM_COUNT      (10UL * 1000 * 1000UL)
+
+// Utility
+static inline float getRandLogitInRange(float maxVal, float minVal)
 {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	float combined = (float)(((unsigned int)rand() << 15) | rand());
 
-    if (idx < n)
-    {
-        output[idx] = expf(input[idx]);
-    }
+	// MSVC's rand() returns a value between 0 and (2^15 - 1)
+
+	float normalized = combined / (float)COMBINED_MAX;
+	return minVal + normalized * (maxVal - minVal);
 }
 
-// Step 2: Reduction using atomic operations
-__global__ void reduceAtomicKernel(float* input, float* sum, unsigned int n)
+// Host CPU softmax implementation
+float findMax_h(float* arr, unsigned int size) 
 {
-    unsigned int idx = blockIdx.x * blockDim.x * 256 + threadIdx.x;
-    float local_sum = 0.0f;
+	float max_val = arr[0];
 
-    // Process multiple consecutive elements with block-level stride
-    for (unsigned int i = idx; i < n && i < (blockIdx.x + 1) * blockDim.x * 256; i += blockDim.x)
-    {
-        local_sum += input[i];
-    }
+	for (unsigned int i = 1; i < size; i++)
+		if (arr[i] > max_val) max_val = arr[i];
 
-    // Atomic update to global sum
-    if (local_sum != 0.0f)
-    {
-        atomicAdd(sum, local_sum);
-    }
+	return max_val;
 }
 
-// Step 3: Kernel for normalization
-__global__ void normalizeKernel(float* input, float sum, float* output, unsigned int n)
+void subMax_h(float* arr, unsigned int size, float maxVal)
 {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < n)
-    {
-        output[idx] = input[idx] / sum;
-    }
+	for (unsigned int i = 0; i < size; i++)
+		arr[i] -= maxVal;
 }
 
-// CPU softmax for verification
-void softmaxCPU(float* input, float* output, unsigned int n)
+float expAndSum_h(float* arr, unsigned int size)
 {
-    float sum = 0.0f;
+	float sum = 0.0f;
 
-    for (unsigned int i = 0; i < n; i++)
-    {
-        output[i] = expf(input[i]);
-        sum += output[i];
-    }
+	for (unsigned int i = 0; i < size; i++)
+	{
+		arr[i] = expf(arr[i]);
+		sum += arr[i];
+	}
 
-    for (unsigned int i = 0; i < n; i++)
-    {
-        output[i] /= sum;
-    }
+	return sum;
 }
 
-// Calculate Mean Squared Error
-float calculateMSE(float* gpu_result, float* cpu_result, unsigned int n)
+void normalize_h(float* arr, unsigned int size, float sum)
 {
-    float mse = 0.0f;
-    
-    for (unsigned int i = 0; i < n; i++)
-    {
-        float diff = gpu_result[i] - cpu_result[i];
-        mse += diff * diff;
-    }
-
-    return mse / n;
+	for (unsigned int i = 0; i < size; i++)
+		arr[i] /= sum;
 }
 
-int main() {
-    const unsigned int n = 10000000; // 10 million elements
-    const unsigned int threadsPerBlock = 256;
-    const unsigned int expBlocks = (n + threadsPerBlock - 1) / threadsPerBlock; // For expKernel and normalizeKernel
-    const unsigned int reduceBlocks = (n + threadsPerBlock * 256 - 1) / (threadsPerBlock * 256); // For reduceAtomicKernel
+// GPU kernels
+__global__ void findMax_d(float* input, unsigned int size, float* reduced)
+{
+	__shared__ float smem[THREADS_PER_BLK];
 
-    // Host arrays
-    float* h_input = (float*)malloc(n * sizeof(float));
-    float* h_output_gpu = (float*)malloc(n * sizeof(float));
-    float* h_output_cpu = (float*)malloc(n * sizeof(float));
+	unsigned int tid = threadIdx.x;
+	float maxVal = -INFINITY;
 
-    // Initialize input with random values
-    srand(42); // Fixed seed for reproducibility
-    for (unsigned int i = 0; i < n; i++) {
-        h_input[i] = (float)rand() / RAND_MAX * 10.0f - 5.0f; // Range [-5, 5]
-    }
+	for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += blockDim.x * gridDim.x)
+		maxVal = fmaxf(maxVal, input[i]);
 
-    // Device arrays
-    float* d_input, * d_exp, * d_sum, * d_output;
-    CUDA_CHECK(cudaMalloc(&d_input, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_exp, n * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output, n * sizeof(float)));
+	smem[tid] = maxVal;
+	__syncthreads();
 
-    // Initialize global sum to 0
-    float zero = 0.0f;
-    CUDA_CHECK(cudaMemcpy(d_sum, &zero, sizeof(float), cudaMemcpyHostToDevice));
+	for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+	{
+		if (tid < s)
+			smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+	
+		__syncthreads();
+	}
+	
+	if (tid == 0)
+		reduced[blockIdx.x] = smem[0];
+}
 
-    // Copy input to device
-    CUDA_CHECK(cudaMemcpy(d_input, h_input, n * sizeof(float), cudaMemcpyHostToDevice));
+__global__ void subAndExp_d(float* input, unsigned int size, float maxVal)
+{
+	for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += blockDim.x * gridDim.x)
+		input[i] = expf(input[i] - maxVal);
+}
 
-    // Timing variables (separate events for each kernel)
-    cudaEvent_t start_exp, stop_exp, start_reduce, stop_reduce, start_norm, stop_norm;
-    CUDA_CHECK(cudaEventCreate(&start_exp));
-    CUDA_CHECK(cudaEventCreate(&stop_exp));
-    CUDA_CHECK(cudaEventCreate(&start_reduce));
-    CUDA_CHECK(cudaEventCreate(&stop_reduce));
-    CUDA_CHECK(cudaEventCreate(&start_norm));
-    CUDA_CHECK(cudaEventCreate(&stop_norm));
-    float milliseconds;
+__global__ void sum_d(float* input, unsigned int size, float* reduced)
+{
+	__shared__ float smem[THREADS_PER_BLK];
 
-    // Step 1: Exponentiation
-    CUDA_CHECK(cudaEventRecord(start_exp, 0));
-    expKernel << <expBlocks, threadsPerBlock >> > (d_input, d_exp, n);
-    CUDA_CHECK(cudaEventRecord(stop_exp, 0));
-    CUDA_CHECK(cudaEventSynchronize(stop_exp));
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_exp, stop_exp));
-    printf("Exponentiation kernel time: %.3f ms\n", milliseconds);
+	unsigned int tid = threadIdx.x;
+	float sum = 0.0f;
 
-    // Step 2: Atomic reduction
-    CUDA_CHECK(cudaEventRecord(start_reduce, 0));
-    reduceAtomicKernel << <reduceBlocks, threadsPerBlock >> > (d_exp, d_sum, n);
-    CUDA_CHECK(cudaEventRecord(stop_reduce, 0));
-    CUDA_CHECK(cudaEventSynchronize(stop_reduce));
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_reduce, stop_reduce));
-    printf("Reduction kernel time: %.3f ms\n", milliseconds);
+	for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += blockDim.x * gridDim.x)
+		sum += input[i];
 
-    // Copy sum to host
-    float h_sum;
-    CUDA_CHECK(cudaMemcpy(&h_sum, d_sum, sizeof(float), cudaMemcpyDeviceToHost));
+	smem[tid] = sum;
+	__syncthreads();
 
-    // Step 3: Normalization
-    CUDA_CHECK(cudaEventRecord(start_norm, 0));
-    normalizeKernel << <expBlocks, threadsPerBlock >> > (d_exp, h_sum, d_output, n);
-    CUDA_CHECK(cudaEventRecord(stop_norm, 0));
-    CUDA_CHECK(cudaEventSynchronize(stop_norm));
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_norm, stop_norm));
-    printf("Normalization kernel time: %.3f ms\n", milliseconds);
+	for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+	{
+		if (tid < s)
+			smem[tid] += smem[tid + s];
+	
+		__syncthreads();
+	}
+	
+	if (tid == 0)
+		reduced[blockIdx.x] = smem[0];
+}
 
-    // Copy result back to host
-    CUDA_CHECK(cudaMemcpy(h_output_gpu, d_output, n * sizeof(float), cudaMemcpyDeviceToHost));
+__global__ void normalize_d(float* input, unsigned int size, float sumVal)
+{
+	for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += blockDim.x * gridDim.x)
+		input[i] /= sumVal;
+}
 
-    // CPU verification
-    softmaxCPU(h_input, h_output_cpu, n);
+int main(void) {
+	const unsigned int total_elements = ELEM_COUNT;
+	const unsigned int threads_per_block = THREADS_PER_BLK;
+	const unsigned int num_blocks = (total_elements + threads_per_block - 1) / threads_per_block;
 
-    // Calculate MSE and display with original precision
-    float mse = calculateMSE(h_output_gpu, h_output_cpu, n);
-    printf("Mean Squared Error: %e\n", mse);
+	// Allocate host memory
+	float* h_input = (float*)malloc(sizeof(float) * total_elements);
+	float* h_cpu_output = (float*)malloc(sizeof(float) * total_elements);
+	float* h_gpu_output = (float*)malloc(sizeof(float) * total_elements);
+	float* h_max_reduced = (float*)malloc(sizeof(float) * num_blocks);
+	float* h_sum_reduced = (float*)malloc(sizeof(float) * num_blocks);
+	HOST_CHECK(h_input && h_cpu_output && h_gpu_output && h_max_reduced && h_sum_reduced, "Host malloc failed");
 
-    // Cleanup
-    CUDA_CHECK(cudaFree(d_input));
-    CUDA_CHECK(cudaFree(d_exp));
-    CUDA_CHECK(cudaFree(d_sum));
-    CUDA_CHECK(cudaFree(d_output));
-    free(h_input);
-    free(h_output_gpu);
-    free(h_output_cpu);
-    CUDA_CHECK(cudaEventDestroy(start_exp));
-    CUDA_CHECK(cudaEventDestroy(stop_exp));
-    CUDA_CHECK(cudaEventDestroy(start_reduce));
-    CUDA_CHECK(cudaEventDestroy(stop_reduce));
-    CUDA_CHECK(cudaEventDestroy(start_norm));
-    CUDA_CHECK(cudaEventDestroy(stop_norm));
+	// Initialize input
+	for (unsigned int i = 0; i < total_elements; i++)
+		h_input[i] = getRandLogitInRange(MAX_LOGIT, MIN_LOGIT);
 
-    return 0;
+	memcpy(h_cpu_output, h_input, sizeof(float) * total_elements);
+
+	// CPU softmax
+	float max_cpu = findMax_h(h_cpu_output, total_elements);
+	subMax_h(h_cpu_output, total_elements, max_cpu);
+	float sum_cpu = expAndSum_h(h_cpu_output, total_elements);
+	normalize_h(h_cpu_output, total_elements, sum_cpu);
+
+	// GPU softmax
+	float* d_input, * d_max, * d_sum;
+	CUDA_CHECK(cudaMalloc(&d_input, sizeof(float) * total_elements));
+	CUDA_CHECK(cudaMalloc(&d_max, sizeof(float) * num_blocks));
+	CUDA_CHECK(cudaMalloc(&d_sum, sizeof(float) * num_blocks));
+	CUDA_CHECK(cudaMemcpy(d_input, h_input, sizeof(float) * total_elements, cudaMemcpyHostToDevice));
+
+	cudaEvent_t start, stop;
+	float elapsed_ms;
+	CUDA_CHECK(cudaEventCreate(&start));
+	CUDA_CHECK(cudaEventCreate(&stop));
+	CUDA_CHECK(cudaEventRecord(start));
+
+	findMax_d << <num_blocks, threads_per_block >> > (d_input, total_elements, d_max);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(h_max_reduced, d_max, sizeof(float) * num_blocks, cudaMemcpyDeviceToHost));
+
+	float max_gpu = -INFINITY;
+	for (unsigned int i = 0; i < num_blocks; ++i)
+		if (h_max_reduced[i] > max_gpu) max_gpu = h_max_reduced[i];
+
+	subAndExp_d << <num_blocks, threads_per_block >> > (d_input, total_elements, max_gpu);
+	CUDA_CHECK(cudaGetLastError());
+
+	sum_d << <num_blocks, threads_per_block >> > (d_input, total_elements, d_sum);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(h_sum_reduced, d_sum, sizeof(float) * num_blocks, cudaMemcpyDeviceToHost));
+
+	float sum_gpu = 0.0f;
+	for (unsigned int i = 0; i < num_blocks; ++i)
+		sum_gpu += h_sum_reduced[i];
+
+	normalize_d << <num_blocks, threads_per_block >> > (d_input, total_elements, sum_gpu);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(h_gpu_output, d_input, sizeof(float) * total_elements, cudaMemcpyDeviceToHost));
+
+	CUDA_CHECK(cudaEventRecord(stop));
+	CUDA_CHECK(cudaEventSynchronize(stop));
+	CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+	printf("Softmax completed. CUDA time: %.3f ms\n", elapsed_ms);
+
+	// Write to CSV
+	FILE* file = fopen("softmax_outputs.csv", "w");
+	HOST_CHECK(file != NULL, "Failed to open CSV file");
+	fprintf(file, "Sno.,GPU Output,CPU Output\n");
+	for (unsigned int i = 0; i < total_elements; i++)
+		fprintf(file, "%u,%.15g,%.15g\n", i, h_gpu_output[i], h_cpu_output[i]);
+	fclose(file);
+	printf("Output written to softmax_outputs.csv\n");
+
+	// Cleanup
+	free(h_input);
+	free(h_cpu_output);
+	free(h_gpu_output);
+	free(h_max_reduced);
+	free(h_sum_reduced);
+	CUDA_CHECK(cudaFree(d_input));
+	CUDA_CHECK(cudaFree(d_max));
+	CUDA_CHECK(cudaFree(d_sum));
+	CUDA_CHECK(cudaEventDestroy(start));
+	CUDA_CHECK(cudaEventDestroy(stop));
+
+	return 0;
 }
